@@ -1,0 +1,10 @@
+models/*
+datasets/*
+__pycache__/*
+analyze_logs/*
+eval_logs/*
+unsloth_compiled_cache/*
+outputs/*
+wandb/*
+grpo_trainer_lora_model_*/*
+*.txt
