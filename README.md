@@ -134,9 +134,14 @@ The models are stored in the ```models``` folder.
 
 ```models/test``` contains the trained models during the RL stage, i.e. the main training for confidence calibration
 
+### WandB Results
 
+Details of our runs can be found in [to be released after the peer review stage as it affects anonymity].
 
+Note that the values for the reinforcement learning at step 0 are unreliable because wandb resets the step count to 0 instead of the last completed step number during the first step of resumption after interruption of some of our runs. 
 
+### Paper
 
+If you find this code useful, please cite our paper:
 
-
+[redacted to maintain anonymity during peer review stage]
