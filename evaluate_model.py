@@ -34,7 +34,10 @@ MAX_OUTPUT_TOKENS = 1024 # to follow RL max token limit
 LORA_RANK = 32
 
 LLM_SHORT_NAME = "qwen2.5-3b"
-DATASET_NAME = "multi-armed-bandit-64"
+# Note: Older versions of the code have DATASET_NAME = "multi-armed-bandit-64" by default!
+DATASET_NAME = "" # Use this command line argument for in-distribution evaluation
+TRAIN_DATASET_NAME = "" # Use this command line argument for out-of-distribution evaluation
+EVAL_DATASET_NAME = "" # # Use this command line argument for out-of-distribution evaluation
 REWARD_SCHEME = "brier-1"
 LLM_CONFIDENCE = True
 CONFIDENCE_ANALYSIS = True
@@ -61,6 +64,8 @@ def generate_outputs(llm, prompts, sampling_params, lora_request):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_name", default=DATASET_NAME, dest='dataset_name', type=str)
+    parser.add_argument("--train_dataset_name", default=TRAIN_DATASET_NAME, dest='train_dataset_name', type=str)
+    parser.add_argument("--eval_dataset_name", default=EVAL_DATASET_NAME, dest='eval_dataset_name', type=str)
     parser.add_argument("--llm", default=LLM_SHORT_NAME, dest='llm_short_name', type=str)
     parser.add_argument("--max_output_tokens", default=MAX_OUTPUT_TOKENS, dest='max_output_tokens', type=int)
     parser.add_argument("--lora_rank", default=LORA_RANK, dest='lora_rank', type=int)
@@ -80,6 +85,8 @@ if __name__ == "__main__":
     print(args)
     
     DATASET_NAME = args.dataset_name
+    TRAIN_DATASET_NAME = args.train_dataset_name
+    EVAL_DATASET_NAME = args.eval_dataset_name
     LLM_SHORT_NAME = args.llm_short_name
     MAX_OUTPUT_TOKENS = args.max_output_tokens
     LORA_RANK = args.lora_rank
@@ -96,22 +103,31 @@ if __name__ == "__main__":
     SAMPLE_SIZE = args.sample_size
 
     assert RUN_SUFFIX.strip() not in ["base", "rl", "sft"], "--run_suffix cannot be base, rl or sft because it may cause confusion"
+
+    # New restriction: RUN_SUFFIX cannot start with eval to avoid confusion with evaluation dataset
+    assert not RUN_SUFFIX.lower().startswith("eval"), "--run_suffix cannot start with eval because it may cause confusion"
+
+    if DATASET_NAME != "":
+        error_msg = "If DATASET_NAME is not empty, then TRAIN_DATASET_NAME and EVAL_DATASET_NAME should not be indicated"
+        assert (TRAIN_DATASET_NAME == "" and EVAL_DATASET_NAME == ""), error_msg
+        TRAIN_DATASET_NAME = DATASET_NAME
+        EVAL_DATASET_NAME = DATASET_NAME
     
     if USE_JSON:
         class AnswerFormat(BaseModel):
             reasoning: str
             
-            if DATASET_NAME == "addition":
+            if EVAL_DATASET_NAME == "addition":
                 answer: int = Field(ge=0)
-            elif DATASET_NAME == "multi-armed-bandit-22222":
+            elif EVAL_DATASET_NAME == "multi-armed-bandit-22222":
                 answer: int = Field(ge=0, le=5)
-            elif DATASET_NAME == "multi-armed-bandit-64":
+            elif EVAL_DATASET_NAME == "multi-armed-bandit-64":
                 answer: int = Field(ge=0, le=2)
-            elif DATASET_NAME == "multi-armed-bandit-82":
+            elif EVAL_DATASET_NAME == "multi-armed-bandit-82":
                 answer: int = Field(ge=0, le=2)
-            elif DATASET_NAME in ["hotpotqa", "hotpotqa-modified", "deepmath-103k", "bigmath"]:
+            elif EVAL_DATASET_NAME in ["hotpotqa", "hotpotqa-modified", "deepmath-103k", "bigmath"]:
                 answer: str = Field(max_length=1000)
-            elif DATASET_NAME in ["noisy-ground-truth-sequential", "noisy-ground-truth-random"]:
+            elif EVAL_DATASET_NAME in ["noisy-ground-truth-sequential", "noisy-ground-truth-random"]:
                 answer: int = Field(ge=0, le=999)
             else:
                 assert False
@@ -137,7 +153,7 @@ if __name__ == "__main__":
     model_name = LLM_LONG_NAME[LLM_SHORT_NAME]
     tokenizer = get_tokenizer(model_name)
     
-    dataset_filename = "datasets/test/%s.csv" % DATASET_NAME
+    dataset_filename = "datasets/test/%s.csv" % EVAL_DATASET_NAME
     dataset = load_dataset("csv", data_files=dataset_filename)["train"]
     
     system_prompt = system_prompt_preprocess(LLM_CONFIDENCE, CONFIDENCE_ANALYSIS) if USE_JSON else system_prompt_rl(CONFIDENCE_ANALYSIS)
@@ -197,16 +213,16 @@ if __name__ == "__main__":
     
     if USE_MODEL == "base":
         # _base at the end of the filename signifies base model
-        model_rl_filename = derived_model_name_sft(DATASET_NAME, LLM_SHORT_NAME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS) + "_base" 
+        model_rl_filename = derived_model_name_sft(TRAIN_DATASET_NAME, LLM_SHORT_NAME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS) + "_base" 
         print("Loading base model %s" % LLM_LONG_NAME[LLM_SHORT_NAME])
     elif USE_MODEL == "sft":
         # _sft at the end of the filename signifies sft model
-        model_sft_filename = derived_model_name_sft(DATASET_NAME, LLM_SHORT_NAME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
+        model_sft_filename = derived_model_name_sft(TRAIN_DATASET_NAME, LLM_SHORT_NAME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
         model_rl_filename = model_sft_filename + "_sft" 
         lora_model_dir = "models/sft/%s" % model_sft_filename
         print("Loading supervised finetuning model %s" % lora_model_dir)
     elif USE_MODEL == "rl":
-        model_rl_filename = derived_model_name_rl(DATASET_NAME, LLM_SHORT_NAME, REWARD_SCHEME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
+        model_rl_filename = derived_model_name_rl(TRAIN_DATASET_NAME, LLM_SHORT_NAME, REWARD_SCHEME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
 
         lora_model_parent_dir = "models/rl/%s/" % model_rl_filename
         checkpoint_index = 0
@@ -230,9 +246,17 @@ if __name__ == "__main__":
 
     # Output file name - also used for experiment id to avoid race conditions
     if USE_MODEL in ["base", "sft"]:
-        output_filename = derived_model_name_sft(DATASET_NAME, LLM_SHORT_NAME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS) + "_" + USE_MODEL 
+        output_filename = derived_model_name_sft(TRAIN_DATASET_NAME, LLM_SHORT_NAME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
+            
+        if TRAIN_DATASET_NAME != EVAL_DATASET_NAME:
+            output_filename += "_eval_" + EVAL_DATASET_NAME
+
+        output_filename += "_" + USE_MODEL 
     elif USE_MODEL == "rl":
-        output_filename = derived_model_name_rl(DATASET_NAME, LLM_SHORT_NAME, REWARD_SCHEME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
+        output_filename = derived_model_name_rl(TRAIN_DATASET_NAME, LLM_SHORT_NAME, REWARD_SCHEME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
+        
+        if TRAIN_DATASET_NAME != EVAL_DATASET_NAME:
+            output_filename += "_eval_" + EVAL_DATASET_NAME
     
     if RUN_SUFFIX != "":
         output_filename += "_" + str(RUN_SUFFIX)
@@ -335,7 +359,7 @@ if __name__ == "__main__":
             rerun_answer_idx.append((i, group_idx))
             answer_is_correct = 0
         else:
-            answer_is_correct = 1 if verify_correctness(DATASET_NAME, answer, ground_truth, experiment_id) else 0
+            answer_is_correct = 1 if verify_correctness(EVAL_DATASET_NAME, answer, ground_truth, experiment_id) else 0
         
         if valid_confidence_output:
             confidence = float(confidence)
@@ -369,7 +393,7 @@ if __name__ == "__main__":
         #print()
     
     REASK_ANSWER_PROMPT = "Reasoning token limit reached. Please output only your final answer within %d tokens." % SECOND_CHANCE_ANSWER_TOKEN_LIMIT
-    if DATASET_NAME in ["bigmath", "deepmath-103k"]:
+    if EVAL_DATASET_NAME in ["bigmath", "deepmath-103k"]:
         REASK_ANSWER_PROMPT += " Express your answer in LaTeX."
 
     REASK_CONFIDENCE_PROMPT = "Please output your confidence as an integer between 0 and 100 inclusive."
@@ -396,7 +420,7 @@ if __name__ == "__main__":
             answer = response[len(SECOND_CHANCE_ANSWER_STRING_PREFIX):]
 
             # Re-evaluate answer
-            answer_is_correct = 1 if verify_correctness(DATASET_NAME, answer, ground_truth, experiment_id) else 0
+            answer_is_correct = 1 if verify_correctness(EVAL_DATASET_NAME, answer, ground_truth, experiment_id) else 0
             if i < 5:
                 print("Indices: (%d, %d, %d)" % (overall_idx, group_idx, overall_idx//RESPONSES_PER_QUESTION))
                 print("Question: ", dataset[overall_idx//RESPONSES_PER_QUESTION]["question"])
