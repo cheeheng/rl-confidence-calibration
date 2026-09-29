@@ -7,83 +7,68 @@ import json
 import argparse
 import torch
 import os
+import yaml
 
-from utils import derived_model_name_rl, derived_model_name_sft
+from pathlib import Path
 
-LLM_SHORT_NAME = "qwen2.5-3b"
-# Note: Older versions of the code have DATASET_NAME = "multi-armed-bandit-64" by default!
-DATASET_NAME = "" # Use this command line argument for in-distribution evaluation
-TRAIN_DATASET_NAME = "" # Use this command line argument for out-of-distribution evaluation
-EVAL_DATASET_NAME = "" # # Use this command line argument for out-of-distribution evaluation
-REWARD_SCHEME = "brier-1"
-LLM_CONFIDENCE = True
-CONFIDENCE_ANALYSIS = True
-USE_MODEL = "rl"
-RUN_SUFFIX = ""
-
-def get_score(confidence_tensor, is_correct_tensor):
-    pass
+from utils import sanity_check_config
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_name", default=DATASET_NAME, dest='dataset_name', type=str)
-    parser.add_argument("--train_dataset_name", default=TRAIN_DATASET_NAME, dest='train_dataset_name', type=str)
-    parser.add_argument("--eval_dataset_name", default=EVAL_DATASET_NAME, dest='eval_dataset_name', type=str)
-    parser.add_argument("--llm", default=LLM_SHORT_NAME, dest='llm_short_name', type=str)
-    parser.add_argument("--reward_scheme", default=REWARD_SCHEME, dest='reward_scheme', type=str)
-    parser.add_argument("--run_suffix", default=RUN_SUFFIX, dest='run_suffix', type=str)
-    #parser.add_argument("--llm_confidence", default=LLM_CONFIDENCE, dest='llm_confidence', action=argparse.BooleanOptionalAction)
-    parser.add_argument("--confidence_analysis", default=CONFIDENCE_ANALYSIS, dest='confidence_analysis', action=argparse.BooleanOptionalAction)
-    parser.add_argument("--use_model", default=USE_MODEL, dest='use_model', type=str)
+    parser.add_argument("--eval_yaml", dest='eval_yaml', type=str)
+    parser.add_argument("--judge_yaml", dest='judge_yaml', type=str)
     args = parser.parse_args()
     print(args)
     
-    DATASET_NAME = args.dataset_name
-    TRAIN_DATASET_NAME = args.train_dataset_name
-    EVAL_DATASET_NAME = args.eval_dataset_name
-    LLM_SHORT_NAME = args.llm_short_name
-    RUN_SUFFIX = args.run_suffix
-    REWARD_SCHEME = args.reward_scheme
-    #LLM_CONFIDENCE = args.llm_confidence
-    CONFIDENCE_ANALYSIS = args.confidence_analysis
-    USE_MODEL = args.use_model
-
-    assert RUN_SUFFIX.strip() not in ["base", "rl", "sft"], "--run_suffix cannot be base, rl or sft because it may cause confusion"
-
-    # New restriction: RUN_SUFFIX cannot start with eval to avoid confusion with evaluation dataset
-    assert not RUN_SUFFIX.lower().startswith("eval"), "--run_suffix cannot start with eval because it may cause confusion"
-
-    if DATASET_NAME != "":
-        error_msg = "If DATASET_NAME is not empty, then TRAIN_DATASET_NAME and EVAL_DATASET_NAME should not be indicated"
-        assert (TRAIN_DATASET_NAME == "" and EVAL_DATASET_NAME == ""), error_msg
-        TRAIN_DATASET_NAME = DATASET_NAME
-        EVAL_DATASET_NAME = DATASET_NAME
+    EVAL_EXPERIMENT_NAME = args.eval_yaml
+    JUDGE_NAME = args.judge_yaml
     
-    if USE_MODEL in ["base", "sft"]:
-        model_rl_filename = derived_model_name_sft(TRAIN_DATASET_NAME, LLM_SHORT_NAME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS) + "_" + USE_MODEL 
-    elif USE_MODEL == "rl":
-        model_rl_filename = derived_model_name_rl(TRAIN_DATASET_NAME, LLM_SHORT_NAME, REWARD_SCHEME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
+    with open(Path("config/eval/") / (EVAL_EXPERIMENT_NAME + ".yaml"), 'r') as file:
+        config = yaml.safe_load(file)
+        RL_EXPERIMENT_NAME = config['rl_experiment_name']
+        USE_MODEL = config['use_model']
+    
+    if RL_EXPERIMENT_NAME is not None and USE_MODEL == "rl":
+        with open(Path("config/rl/") / (RL_EXPERIMENT_NAME + ".yaml"), 'r') as file:
+            rl_config = yaml.safe_load(file)
+        sanity_check_config(config, rl_config)
     else:
-        assert False, "--use_model must be either base, sft or rl"
+        rl_config = None
     
-    if TRAIN_DATASET_NAME != EVAL_DATASET_NAME:
-        model_rl_filename += "_eval_" + EVAL_DATASET_NAME
-
-    if RUN_SUFFIX != "":
-        model_rl_filename += "_" + str(RUN_SUFFIX)
-    
-    eval_data_filename = model_rl_filename
+    eval_data_filename = EVAL_EXPERIMENT_NAME
     print("Loading raw evaluation data from models/evaluate/%s.json" % eval_data_filename)
-    with open("models/evaluate/%s.json" % eval_data_filename, "r") as json_file:
+    with open(Path("models/evaluate") / ("%s.json" % eval_data_filename), "r") as json_file:
         group_statistics = json.load(json_file)
+    
+    print("Loading abstention data from models/evaluate/abstain/%s/%s.json" % (JUDGE_NAME, eval_data_filename))
+    abstention_path = Path("models/evaluate/abstain") / JUDGE_NAME / ("%s.json" % eval_data_filename)
+    abstention_statistics_ready = abstention_path.is_file()
+    if abstention_statistics_ready:
+        with open(abstention_path, "r") as json_file:
+            abstention_statistics = json.load(json_file)
+            
+        # Only open judge config if abstention statistics are present
+        with open(Path("config/judge/") / (JUDGE_NAME + ".yaml"), 'r') as file:
+            judge_config = yaml.safe_load(file)
+    else:
+        print("Abstention data cannot be found: skipping")
     
     groups = group_statistics.keys()
     groups = [group for group in groups if group != "metadata"]
-
-    RESPONSES_PER_QUESTION = group_statistics["metadata"]["responses_per_question"]
-
-    print("Metadata - model evaluation settings")
+    
+    print("Metadata - model RL and evaluation parameters")
     print(group_statistics["metadata"])
+    if abstention_statistics_ready:
+        print(abstention_statistics["metadata"])
+    
+    # Ensures configuration is not accidentally messed up during evaluation
+    assert group_statistics["metadata"]["eval_config"] == config
+    if abstention_statistics_ready: 
+        assert abstention_statistics["metadata"]["eval_config"] == config
+        assert abstention_statistics["metadata"]["judge_config"] == judge_config
+        assert abstention_statistics["metadata"]["dataset_stats"]["num_questions"] == group_statistics["metadata"]["dataset_stats"]["num_questions"]
+
+    RESPONSES_PER_QUESTION = group_statistics["metadata"]["eval_config"]["responses_per_question"]
     
     # Compute evaluation metrics here
     group_results = {}
@@ -106,6 +91,18 @@ if __name__ == "__main__":
             
         confidence_tensor = torch.tensor(group_statistics[group]['confidences'], dtype=torch.float64)
         is_correct_tensor = torch.tensor(group_statistics[group]['is_correct'], dtype=torch.float64)
+        
+        if abstention_statistics_ready:
+            unanswerable_rate = abstention_statistics[group]['counts']['unanswerable'] / total_questions
+            other_abstain_rate = abstention_statistics[group]['counts']['abstain'] / total_questions
+            answer_rate = abstention_statistics[group]['counts']['answer'] / total_questions
+            llm_judge_format_error_rate = abstention_statistics[group]['llm_judge_format_errors'] / total_questions
+            assert (abstention_statistics[group]['counts']['unanswerable'] + abstention_statistics[group]['counts']['abstain'] + abstention_statistics[group]['counts']['answer'] 
+                + abstention_statistics[group]['llm_judge_format_errors']) == total_questions
+            
+            # To ensure data consistency
+            for verdict in ['answer', 'abstain', 'unanswerable']:
+                assert abstention_statistics[group]['counts'][verdict] == abstention_statistics[group]['llm_judge_verdicts'].count(verdict)
 
         questions_with_mixed_results = 0
         total_average_confidence_correct = 0
@@ -198,6 +195,26 @@ if __name__ == "__main__":
         #print("Expected Correct - Actual Correct: %.4f" % (accuracy - average_confidence))
         calibration_bias = float(accuracy - average_confidence)
         print("Calibration bias: %.4f" % calibration_bias)
+        
+        if abstention_statistics_ready:
+            total_abstain_rate = unanswerable_rate + other_abstain_rate
+            print("Unanswerable rate: %.4f" % unanswerable_rate)
+            print("Other abstain rate: %.4f" % other_abstain_rate)
+            print("Total abstain rate: %.4f" % total_abstain_rate)
+            print("Answer rate: %.4f" % answer_rate)
+            print("LLM judge format error rate: %.4f" % llm_judge_format_error_rate)
+            group_results[group]['unanswerable_rate'] = unanswerable_rate
+            group_results[group]['other_abstain_rate'] = other_abstain_rate
+            group_results[group]['total_abstain_rate'] = total_abstain_rate
+            group_results[group]['answer_rate'] = answer_rate
+            group_results[group]['llm_judge_format_errors'] = llm_judge_format_error_rate
+        else:
+            group_results[group]['unanswerable_rate'] = None
+            group_results[group]['other_abstain_rate'] = None
+            group_results[group]['total_abstain_rate'] = None
+            group_results[group]['answer_rate'] = None
+            group_results[group]['llm_judge_format_errors'] = None
+        
         print()
 
 
@@ -215,15 +232,24 @@ if __name__ == "__main__":
     
     #print(group_results)
 
-    if not os.path.exists("models/results"):
-        os.makedirs("models/results")
+    if not os.path.exists("models/results/%s" % JUDGE_NAME):
+        os.makedirs("models/results/%s" % JUDGE_NAME)
 
     output_filename = eval_data_filename
     output_data = {}
-    output_data['eval_params'] = vars(args)
-    del output_data['eval_params']['dataset_name']
-    output_data['eval_params']['train_dataset_name'] = TRAIN_DATASET_NAME
-    output_data['eval_params']['eval_dataset_name'] = EVAL_DATASET_NAME
+    
+    if RL_EXPERIMENT_NAME is not None and RL_EXPERIMENT_NAME != "":
+        with open(Path("config/rl/") / (RL_EXPERIMENT_NAME + ".yaml"), 'r') as file:
+            rl_config = yaml.safe_load(file)
+    
+    output_data['rl_params'] = rl_config
+    output_data['eval_params'] = config
+    output_data['rl_config_name'] = RL_EXPERIMENT_NAME
+    output_data['eval_config_name'] = EVAL_EXPERIMENT_NAME
     output_data['group_results'] = group_results
-    with open("models/results/%s.json" % output_filename, "w") as json_file:
+    
+    if abstention_statistics_ready:
+        output_data['judge_params'] = judge_config
+        output_data['judge_config_name'] = JUDGE_NAME
+    with open(Path("models/results") / JUDGE_NAME / ("%s.json" % output_filename), "w") as json_file:
         json.dump(output_data, json_file, indent=4)

@@ -6,14 +6,16 @@ import pandas as pd
 
 from pathlib import Path
 
-JSON_DIR = "models/results" # Directory from which to recusively look for results
+JSON_DIR = "models/results" # Directory from which to recursively look for results
 EVAL_DATASET_NAME = "" # If empty, it defaults to showing all, otherwise, only the indicated dataset is shown
+JUDGE_NAME = "" # If empty, it defaults to showing all, otherwise, only the indicated judge is shown
 OUTFILE_NAME = "results" # Output csv file name
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--json_dir", default=JSON_DIR, dest='json_dir', type=str)
     parser.add_argument("--eval_dataset_name", default=EVAL_DATASET_NAME, dest='eval_dataset_name', type=str)
+    parser.add_argument("--judge_name", default=JUDGE_NAME, dest='judge_name', type=str)
     parser.add_argument("--outfile_name", default=OUTFILE_NAME, dest='outfile_name', type=str)
     
     args = parser.parse_args()
@@ -21,6 +23,7 @@ if __name__ == "__main__":
     
     JSON_DIR = args.json_dir
     EVAL_DATASET_NAME = args.eval_dataset_name
+    JUDGE_NAME = args.judge_name
     OUTFILE_NAME = args.outfile_name
 
     # Looks for all the relevant json files.
@@ -37,16 +40,23 @@ if __name__ == "__main__":
 
     group_set = set()
     eval_param_set = set()
+    judge_param_set = set()
     invalid_paths = set()
     for path in data:
         valid_json = True
+        # judge_params is optional
         for attr_name in ['group_results', 'eval_params']:
             if attr_name not in data[path]:
                 print("The JSON content in %s does not have %s attribute" % (path, attr_name))
                 valid_json = False
         
         if EVAL_DATASET_NAME != "" and ('eval_params' not in data[path] or data[path]['eval_params']['eval_dataset_name'] != EVAL_DATASET_NAME):
-            print("The JSON content in %s is not of the requested evaluation dataset")
+            print("The JSON content in %s is not of the requested evaluation dataset" % path)
+            valid_json = False
+        
+        if JUDGE_NAME != "" and ('judge_params' not in data[path] or data[path]['judge_params']['llm_judge_short_name'] != JUDGE_NAME):
+            print("The JSON content in %s is not of the requested LLM abstention judge" % path)
+            valid_json = False
  
         if not valid_json:
             invalid_paths.add(path)
@@ -64,16 +74,22 @@ if __name__ == "__main__":
         
         for eval_param in data[path]['eval_params']:
             eval_param_set.add(eval_param)
+            
+        if 'judge_params' in data[path]:
+            for judge_param in data[path]['judge_params']:
+                judge_param_set.add(judge_param)
 
     group_list = ["overall"] + sorted(group_set)
     eval_param_list = list(eval_param_set)
+    judge_param_list = list(judge_param_set)
     print("Groups:", group_list)
     print("Eval params:", eval_param_list)
+    print("Judge params:", judge_param_list)
 
     statistics = ["questions", "questions_with_mixed_results", "mixed_average_confidence_correct", "mixed_average_confidence_wrong",
         "average_confidence", "accuracy", "invalid_format_rate", "invalid_answer_rate", "invalid_confidence_rate", "ece_5_bins", 
         "rmsce_5_bins", "ece_10_bins", "rmsce_10_bins", "ece_20_bins", "rmsce_20_bins", "brier_score", "log_loss", "auroc",
-        "brier-1", "calibration_bias"]
+        "brier-1", "calibration_bias", "unanswerable_rate", "other_abstain_rate", "total_abstain_rate", "answer_rate"]
     
     statistic_set = set(statistics)
     rows_list = []
@@ -88,6 +104,12 @@ if __name__ == "__main__":
         eval_params = data[path]['eval_params']
         for eval_param in eval_params:
             row[(eval_param, None)] = eval_params[eval_param]
+        
+        # LLM abstention judge params (optional)
+        if 'judge_params' in data[path]:
+            judge_params = data[path]['judge_params']
+            for judge_param in judge_params:
+                row[(judge_param, None)] = judge_params[judge_param]
 
         group_results = data[path]['group_results']
         for group in group_results:

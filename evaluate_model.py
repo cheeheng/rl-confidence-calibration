@@ -1,6 +1,6 @@
-# Google Search Gemini AI is used to create part of the code
+# Google Search Gemini AI is used to assist in creating part of the code, with human supervision and verification.
 import os
-from unsloth import FastLanguageModel
+from unsloth import FastLanguageModel, FastVisionModel
 import secrets
 
 # Attempts to help ensure reproducibility: https://discuss.vllm.ai/t/two-different-runs-give-different-answers/2025
@@ -14,10 +14,8 @@ os.environ["UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE"] = "1"
 
 from vllm import LLM, SamplingParams, TokensPrompt
 from vllm.lora.request import LoRARequest
-from vllm.transformers_utils.tokenizer import get_tokenizer
+from vllm.tokenizers import get_tokenizer
 from vllm.sampling_params import StructuredOutputsParams
-from utils import verify_correctness, LLM_LONG_NAME, system_prompt_rl, rl_format_regex, system_prompt_preprocess
-from utils import derived_model_name_rl, derived_model_name_sft, has_valid_xml_tag, add_escape_characters
 from datasets import load_dataset
 from pathlib import Path
 from transformers import TextStreamer
@@ -27,32 +25,13 @@ from pydantic import BaseModel, ConfigDict, Field
 import json
 import argparse
 import re
+import yaml
 
-from utils import extract_xml_tag, find_token_length, confidence_is_valid
-
-MAX_OUTPUT_TOKENS = 1024 # to follow RL max token limit
-LORA_RANK = 32
-
-LLM_SHORT_NAME = "qwen2.5-3b"
-# Note: Older versions of the code have DATASET_NAME = "multi-armed-bandit-64" by default!
-DATASET_NAME = "" # Use this command line argument for in-distribution evaluation
-TRAIN_DATASET_NAME = "" # Use this command line argument for out-of-distribution evaluation
-EVAL_DATASET_NAME = "" # # Use this command line argument for out-of-distribution evaluation
-REWARD_SCHEME = "brier-1"
-LLM_CONFIDENCE = True
-CONFIDENCE_ANALYSIS = True
-USE_MODEL = "rl"
-USE_UNSLOTH = False
-RUN_SUFFIX = ""
-RESPONSES_PER_QUESTION = 1
-SECOND_CHANCE_ANSWER_TOKEN_LIMIT = 64
-USE_JSON = False
-SAMPLE_SIZE = -1
-
-NUM_CPU_THREADS = 8
-
-def normalize_confidence(confidence):
-    return (confidence + 0.5) / 101
+from utils import verify_correctness, LLM_LONG_NAME, get_system_prompt
+from utils import get_temperature, get_top_p, get_top_k, get_min_p
+from utils import AnswerFormat, find_token_length, is_multimodal
+from utils import parse_and_grade_response, sanity_check_config
+from utils import normalize_confidence, get_chat_template_format
 
 def generate_outputs(llm, prompts, sampling_params, lora_request):
     if USE_UNSLOTH:
@@ -63,88 +42,46 @@ def generate_outputs(llm, prompts, sampling_params, lora_request):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_name", default=DATASET_NAME, dest='dataset_name', type=str)
-    parser.add_argument("--train_dataset_name", default=TRAIN_DATASET_NAME, dest='train_dataset_name', type=str)
-    parser.add_argument("--eval_dataset_name", default=EVAL_DATASET_NAME, dest='eval_dataset_name', type=str)
-    parser.add_argument("--llm", default=LLM_SHORT_NAME, dest='llm_short_name', type=str)
-    parser.add_argument("--max_output_tokens", default=MAX_OUTPUT_TOKENS, dest='max_output_tokens', type=int)
-    parser.add_argument("--lora_rank", default=LORA_RANK, dest='lora_rank', type=int)
-    parser.add_argument("--num_cpu_threads", default=NUM_CPU_THREADS, dest='num_cpu_threads', type=int)
-    parser.add_argument("--reward_scheme", default=REWARD_SCHEME, dest='reward_scheme', type=str)
-    parser.add_argument("--run_suffix", default=RUN_SUFFIX, dest='run_suffix', type=str)
-    #parser.add_argument("--llm_confidence", default=LLM_CONFIDENCE, dest='llm_confidence', action=argparse.BooleanOptionalAction)
-    parser.add_argument("--confidence_analysis", default=CONFIDENCE_ANALYSIS, dest='confidence_analysis', action=argparse.BooleanOptionalAction)
-    parser.add_argument("--use_model", default=USE_MODEL, dest='use_model', type=str)
-    parser.add_argument("--use_unsloth", default=USE_UNSLOTH, dest='use_unsloth', action=argparse.BooleanOptionalAction)
-    parser.add_argument("--responses_per_question", default=RESPONSES_PER_QUESTION, dest='responses_per_question', type=int)
-    parser.add_argument("--second_chance_answer_token_limit", default=SECOND_CHANCE_ANSWER_TOKEN_LIMIT, 
-        dest="second_chance_answer_token_limit", type=int)
-    parser.add_argument("--use_json", default=USE_JSON, dest='use_json', action=argparse.BooleanOptionalAction)
-    parser.add_argument("--sample_size", default=SAMPLE_SIZE, dest='sample_size', type=int)
+    parser.add_argument("--eval_yaml", dest='eval_yaml', type=str)
     args = parser.parse_args()
     print(args)
     
-    DATASET_NAME = args.dataset_name
-    TRAIN_DATASET_NAME = args.train_dataset_name
-    EVAL_DATASET_NAME = args.eval_dataset_name
-    LLM_SHORT_NAME = args.llm_short_name
-    MAX_OUTPUT_TOKENS = args.max_output_tokens
-    LORA_RANK = args.lora_rank
-    NUM_CPU_THREADS = args.num_cpu_threads
-    REWARD_SCHEME = args.reward_scheme
-    RUN_SUFFIX = args.run_suffix
-    #LLM_CONFIDENCE = args.llm_confidence
-    CONFIDENCE_ANALYSIS = args.confidence_analysis
-    USE_MODEL = args.use_model
-    USE_UNSLOTH = args.use_unsloth
-    RESPONSES_PER_QUESTION = args.responses_per_question
-    SECOND_CHANCE_ANSWER_TOKEN_LIMIT = args.second_chance_answer_token_limit
-    USE_JSON = args.use_json
-    SAMPLE_SIZE = args.sample_size
-
-    assert RUN_SUFFIX.strip() not in ["base", "rl", "sft"], "--run_suffix cannot be base, rl or sft because it may cause confusion"
-
-    # New restriction: RUN_SUFFIX cannot start with eval to avoid confusion with evaluation dataset
-    assert not RUN_SUFFIX.lower().startswith("eval"), "--run_suffix cannot start with eval because it may cause confusion"
-
-    if DATASET_NAME != "":
-        error_msg = "If DATASET_NAME is not empty, then TRAIN_DATASET_NAME and EVAL_DATASET_NAME should not be indicated"
-        assert (TRAIN_DATASET_NAME == "" and EVAL_DATASET_NAME == ""), error_msg
-        TRAIN_DATASET_NAME = DATASET_NAME
-        EVAL_DATASET_NAME = DATASET_NAME
+    EVAL_EXPERIMENT_NAME = args.eval_yaml
     
-    if USE_JSON:
-        class AnswerFormat(BaseModel):
-            reasoning: str
-            
-            if EVAL_DATASET_NAME == "addition":
-                answer: int = Field(ge=0)
-            elif EVAL_DATASET_NAME == "multi-armed-bandit-22222":
-                answer: int = Field(ge=0, le=5)
-            elif EVAL_DATASET_NAME == "multi-armed-bandit-64":
-                answer: int = Field(ge=0, le=2)
-            elif EVAL_DATASET_NAME == "multi-armed-bandit-82":
-                answer: int = Field(ge=0, le=2)
-            elif EVAL_DATASET_NAME in ["hotpotqa", "hotpotqa-modified", "deepmath-103k", "bigmath"]:
-                answer: str = Field(max_length=1000)
-            elif EVAL_DATASET_NAME in ["noisy-ground-truth-sequential", "noisy-ground-truth-random"]:
-                answer: int = Field(ge=0, le=999)
-            else:
-                assert False
-            
-            if CONFIDENCE_ANALYSIS:
-                confidence_analysis: str
-            
-            if LLM_CONFIDENCE:
-                confidence: int = Field(ge=0, le=100)
-            
-            model_config = ConfigDict(extra='forbid', strict=True)
+    with open(Path("config/eval/") / (EVAL_EXPERIMENT_NAME + ".yaml"), 'r') as file:
+        config = yaml.safe_load(file)
+        print(config)
         
-        answer_format_schema = AnswerFormat.model_json_schema()
-        print(answer_format_schema)
-        structured_outputs_params = StructuredOutputsParams(json=answer_format_schema, strict_mode=True)
+        LLM_SHORT_NAME = config['llm_short_name']
+        ENABLE_THINKING = config['enable_thinking']
+        THINKING_BUDGET = config['thinking_budget']
+        USE_FORMAT_ENFORCER_FIRST_ATTEMPT = config['use_format_enforcer_first_attempt']
+        USE_UNSLOTH = config['use_unsloth']
+        RANDOM_SEED = config['random_seed_eval']
+
+        EVAL_DATASET_NAME = config['eval_dataset_name']
+        USE_MODEL = config['use_model']
+        MAX_OUTPUT_TOKENS = config['max_output_tokens']
+        SECOND_CHANCE_ANSWER_TOKEN_LIMIT = config['second_chance_answer_token_limit']
+        RL_EXPERIMENT_NAME = config['rl_experiment_name']
+        
+        NUM_CPU_THREADS = config['num_cpu_threads']
+        
+        SAMPLE_SIZE = config['sample_size']
+        RESPONSES_PER_QUESTION = config['responses_per_question']
+    
+    if RL_EXPERIMENT_NAME is not None and USE_MODEL == "rl":
+        with open(Path("config/rl/") / (RL_EXPERIMENT_NAME + ".yaml"), 'r') as file:
+            rl_config = yaml.safe_load(file)
+        sanity_check_config(config, rl_config)
+        
+        LORA_RANK = rl_config['lora_rank']
     else:
-        structured_outputs_params = StructuredOutputsParams(regex=rl_format_regex(CONFIDENCE_ANALYSIS), strict_mode=True)
+        rl_config = None
+
+    answer_format_schema = AnswerFormat.model_json_schema()
+    print(answer_format_schema)
+    structured_outputs_params = StructuredOutputsParams(json=answer_format_schema, strict_mode=True)
     
     SECOND_CHANCE_ANSWER_STRING_PREFIX = "Final Answer:"
     structured_outputs_answer_params = StructuredOutputsParams(regex="^%s.*" % SECOND_CHANCE_ANSWER_STRING_PREFIX, strict_mode=True)
@@ -156,13 +93,13 @@ if __name__ == "__main__":
     dataset_filename = "datasets/test/%s.csv" % EVAL_DATASET_NAME
     dataset = load_dataset("csv", data_files=dataset_filename)["train"]
     
-    system_prompt = system_prompt_preprocess(LLM_CONFIDENCE, CONFIDENCE_ANALYSIS) if USE_JSON else system_prompt_rl(CONFIDENCE_ANALYSIS)
+    system_prompt = get_system_prompt(ENABLE_THINKING)
     def generate_prompt(entry, tokenizer):
         entry["prompt"] = [
             {"role" : "system", "content" : system_prompt},
             {"role" : "user", "content" : entry["question"]},
         ]
-        entry["prompt"] = tokenizer.apply_chat_template(entry["prompt"], tokenize = False, add_generation_prompt = True)
+        entry["prompt"] = tokenizer.apply_chat_template(entry["prompt"], tokenize = False, add_generation_prompt = True, enable_thinking = ENABLE_THINKING)
         #print(entry)
         #assert False
         return entry
@@ -174,6 +111,16 @@ if __name__ == "__main__":
     max_prompt_length = max(list(dataset["token_length"]))
     print("Longest prompt in test dataset has %d token(s)." % max_prompt_length)
     max_model_length = MAX_OUTPUT_TOKENS + max_prompt_length + SECOND_CHANCE_ANSWER_TOKEN_LIMIT + 1024
+    
+    # A bug has been spotted that is expected to affect only Gemma 4 (E2B) Instruct.
+    # Extra backslashes are added to unescaped characters to ensure proper escaping of characters, most applicable to Gemma 4 (E2B) Instruct which often outputs broken JSON.
+    # This increases the number of tokens in the output, which increases the risk of insufficient context window errors.
+    # At the time of bug discovery, Qwen 3 (4B) evaluations are ongoing and are expected to be unaffected by the bug.
+    # On the other hand, a Gemma 4 (E2B) Instruct evaluation on correctness-only reward scheme has earlier crashed due to insufficient context window.
+    if LLM_SHORT_NAME.startswith("gemma4-"):
+        # Add a two times safety margin for the output tokens of the initial response to account for the added escape backslashes to fix defective JSON.
+        # Update: A two times safety margin is not enough in extremely rare cases, hence we are increasing it to three times.
+        max_model_length += 2*MAX_OUTPUT_TOKENS
 
     chat_templates = []
     if SAMPLE_SIZE != -1:
@@ -189,15 +136,21 @@ if __name__ == "__main__":
             #assert False
     
     sampling_params = SamplingParams(
-        temperature = 1.0,
-        structured_outputs = structured_outputs_params,
+        temperature = get_temperature(LLM_SHORT_NAME, ENABLE_THINKING),
+        top_p = get_top_p(LLM_SHORT_NAME, ENABLE_THINKING),
+        top_k = get_top_k(LLM_SHORT_NAME, ENABLE_THINKING),
+        min_p = get_min_p(LLM_SHORT_NAME, ENABLE_THINKING),
+        structured_outputs = structured_outputs_params if USE_FORMAT_ENFORCER_FIRST_ATTEMPT else None,
         # "maximum number of generated tokens per output sequence"
         # according to documentation from https://docs.vllm.ai/en/latest/api/vllm/sampling_params/#vllm.sampling_params.SamplingParams.logprobs
         max_tokens = MAX_OUTPUT_TOKENS, 
     )
 
     sampling_params_answer = SamplingParams(
-        temperature = 1.0,
+        temperature = get_temperature(LLM_SHORT_NAME, ENABLE_THINKING),
+        top_p = get_top_p(LLM_SHORT_NAME, ENABLE_THINKING),
+        top_k = get_top_k(LLM_SHORT_NAME, ENABLE_THINKING),
+        min_p = get_min_p(LLM_SHORT_NAME, ENABLE_THINKING),
         structured_outputs = structured_outputs_answer_params,
         # "maximum number of generated tokens per output sequence"
         # according to documentation from https://docs.vllm.ai/en/latest/api/vllm/sampling_params/#vllm.sampling_params.SamplingParams.logprobs
@@ -205,26 +158,20 @@ if __name__ == "__main__":
     )
 
     sampling_params_confidence = SamplingParams(
-        temperature = 1.0,
+        temperature = get_temperature(LLM_SHORT_NAME, ENABLE_THINKING),
+        top_p = get_top_p(LLM_SHORT_NAME, ENABLE_THINKING),
+        top_k = get_top_k(LLM_SHORT_NAME, ENABLE_THINKING),
+        min_p = get_min_p(LLM_SHORT_NAME, ENABLE_THINKING),
         structured_outputs = structured_outputs_confidence_params,
     )
 
-    prompts = tokenizer.apply_chat_template(chat_templates, tokenize = False, add_generation_prompt = True)
+    prompts = tokenizer.apply_chat_template(chat_templates, tokenize = False, add_generation_prompt = True, enable_thinking = ENABLE_THINKING)
     
     if USE_MODEL == "base":
         # _base at the end of the filename signifies base model
-        model_rl_filename = derived_model_name_sft(TRAIN_DATASET_NAME, LLM_SHORT_NAME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS) + "_base" 
         print("Loading base model %s" % LLM_LONG_NAME[LLM_SHORT_NAME])
-    elif USE_MODEL == "sft":
-        # _sft at the end of the filename signifies sft model
-        model_sft_filename = derived_model_name_sft(TRAIN_DATASET_NAME, LLM_SHORT_NAME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
-        model_rl_filename = model_sft_filename + "_sft" 
-        lora_model_dir = "models/sft/%s" % model_sft_filename
-        print("Loading supervised finetuning model %s" % lora_model_dir)
     elif USE_MODEL == "rl":
-        model_rl_filename = derived_model_name_rl(TRAIN_DATASET_NAME, LLM_SHORT_NAME, REWARD_SCHEME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
-
-        lora_model_parent_dir = "models/rl/%s/" % model_rl_filename
+        lora_model_parent_dir = "models/rl/%s/" % RL_EXPERIMENT_NAME
         checkpoint_index = 0
         found_directories = [p for p in Path(lora_model_parent_dir).glob("checkpoint-*") if p.is_dir()]
         for directory in found_directories:
@@ -238,57 +185,53 @@ if __name__ == "__main__":
 
         lora_model_dir = lora_model_parent_dir + "checkpoint-" + str(checkpoint_index)
         print("Loading from LoRA model file %s" % lora_model_dir)
-
-        if RUN_SUFFIX != "":
-            model_rl_filename += "_" + str(RUN_SUFFIX)
     else:
-        assert False, "--use_model must be either base, sft or rl"
+        # SFT support is dropped because it is found to be unnecessary.
+        assert False, "--use_model must be either base or rl"
 
-    # Output file name - also used for experiment id to avoid race conditions
-    if USE_MODEL in ["base", "sft"]:
-        output_filename = derived_model_name_sft(TRAIN_DATASET_NAME, LLM_SHORT_NAME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
-            
-        if TRAIN_DATASET_NAME != EVAL_DATASET_NAME:
-            output_filename += "_eval_" + EVAL_DATASET_NAME
-
-        output_filename += "_" + USE_MODEL 
-    elif USE_MODEL == "rl":
-        output_filename = derived_model_name_rl(TRAIN_DATASET_NAME, LLM_SHORT_NAME, REWARD_SCHEME, LLM_CONFIDENCE, CONFIDENCE_ANALYSIS)
-        
-        if TRAIN_DATASET_NAME != EVAL_DATASET_NAME:
-            output_filename += "_eval_" + EVAL_DATASET_NAME
-    
-    if RUN_SUFFIX != "":
-        output_filename += "_" + str(RUN_SUFFIX)
-
+    output_filename = EVAL_EXPERIMENT_NAME
     experiment_id = "eval_" + output_filename
     
     # Check if unsloth works here
     # The LLM inference code is modified from https://github.com/unslothai/unsloth/issues/2551
 
     base_model_name = LLM_LONG_NAME[LLM_SHORT_NAME]
+    
+    enable_lora = False if USE_MODEL == "base" else True
+    if enable_lora:
+        max_lora_rank = LORA_RANK
+    else:
+        max_lora_rank = None
+    
+    if is_multimodal(LLM_SHORT_NAME):
+        ModelClass = FastVisionModel
+    else:
+        ModelClass = FastLanguageModel
 
     if USE_UNSLOTH:
-        llm, _ = FastLanguageModel.from_pretrained(
+        llm, _ = ModelClass.from_pretrained(
             model_name = base_model_name,
             max_seq_length = max_model_length,
-            seed = 467915983,
-            gpu_memory_utilization=0.8,
+            seed = RANDOM_SEED,
+            gpu_memory_utilization=0.85,
             fast_inference = True, # Uses vLLM
             load_in_4bit = False,
             load_in_8bit = False,
-            enable_lora = False if USE_MODEL == "base" else True,
-            max_lora_rank = LORA_RANK)
-        FastLanguageModel.for_inference(llm)
+            enable_lora = enable_lora,
+            text_only = True,
+            max_lora_rank = max_lora_rank)
+        ModelClass.for_inference(llm)
     else:
         llm = LLM(model=base_model_name, 
             max_model_len=max_model_length, 
-            seed = 905244229, 
-            gpu_memory_utilization=0.8,
-            enable_lora = False if USE_MODEL == "base" else True,
-            max_lora_rank = LORA_RANK)
+            seed = RANDOM_SEED, 
+            gpu_memory_utilization=0.85,
+            enable_lora = enable_lora,
+            max_lora_rank = max_lora_rank,
+            # enforce_eager=True, # This is needed for Ministral 3 (3B) Reasoning 2512 to work
+            language_model_only=True)
 
-    lora_request = None if USE_MODEL == "base" else LoRARequest(lora_name="lora_adapter", lora_int_id=1+secrets.randbelow((1<<63) - 1), lora_path=lora_model_dir)
+    lora_request = None if USE_MODEL == "base" else LoRARequest(lora_name="lora_adapter", lora_int_id=1+secrets.randbelow((1<<31) - 1), lora_path=lora_model_dir)
 
     outputs = generate_outputs(llm, prompts, sampling_params, lora_request)
     
@@ -302,9 +245,10 @@ if __name__ == "__main__":
     groups.append(ALL_GROUPS)
 
     assert "metadata" not in groups
-    group_statistics = {}
-    group_statistics["metadata"] = vars(args)
-    group_statistics["metadata"]["num_questions"] = N_test
+    group_statistics = {"metadata": {}}
+    group_statistics["metadata"]["eval_config"] = config
+    group_statistics["metadata"]["rl_config"] = rl_config
+    group_statistics["metadata"]["dataset_stats"] = {"num_questions": N_test}
     for group in groups:
         group_statistics[group] = {'is_correct': [], 'confidences': [], 
             'invalid_counts': {'confidence': 0, 'answer': 0, 'format': 0}}
@@ -312,6 +256,7 @@ if __name__ == "__main__":
     print("Sanity check (first 10 responses)")
     rerun_answer_idx = []
     rerun_confidence_idx = []
+    final_answers = [None for i in range(len(chat_templates))]
     for i in range(len(chat_templates)):
         #print("Output %d" % i)
         response = outputs[i].outputs[0].text
@@ -322,32 +267,16 @@ if __name__ == "__main__":
 
         group_idx = len(group_statistics[group]['is_correct'])
         assert group_idx == len(group_statistics[group]['confidences'])
-
-        if USE_JSON:
-            try:
-                response_json = json.loads(response)
-                format_is_valid = True
-
-                response_json['reasoning'] = add_escape_characters(str(response_json['reasoning']))
-                response_json['answer'] = add_escape_characters(str(response_json['answer']))
-                answer = response_json['answer']
-                answer_is_valid = True
-
-                confidence = response_json['confidence']
-                valid_confidence_output = confidence_is_valid(confidence)
-            except json.decoder.JSONDecodeError:
-                answer = "" # Invalid answer
-                answer_is_valid = False
-                valid_confidence_output = False
-                format_is_valid = False
-        else:
-            format_is_valid = re.fullmatch(rl_format_regex(CONFIDENCE_ANALYSIS), response)
-
-            answer = extract_xml_tag(response, "answer")
-            confidence = extract_xml_tag(response, "confidence")
-            
-            answer_is_valid = has_valid_xml_tag(response, "answer")
-            valid_confidence_output = confidence_is_valid(confidence) and has_valid_xml_tag(response, "confidence")
+        
+        response_json = parse_and_grade_response(response, EVAL_DATASET_NAME, ground_truth, experiment_id)
+        format_is_valid = not response_json['invalid_format']
+        answer_is_valid = 'answer' not in response_json['invalid_fields']
+        valid_confidence_output = 'confidence' not in response_json['invalid_fields']
+        answer_is_correct = bool(response_json['correct'])
+        answer = response_json['answer']
+        confidence = int(response_json['confidence'])
+        
+        final_answers[i] = answer # To record so that abstention can be judeged
         
         if not format_is_valid:
             group_statistics[group]['invalid_counts']['format'] += 1
@@ -357,15 +286,8 @@ if __name__ == "__main__":
             group_statistics[group]['invalid_counts']['answer'] += 1
             group_statistics[ALL_GROUPS]['invalid_counts']['answer'] += 1
             rerun_answer_idx.append((i, group_idx))
-            answer_is_correct = 0
-        else:
-            answer_is_correct = 1 if verify_correctness(EVAL_DATASET_NAME, answer, ground_truth, experiment_id) else 0
         
-        if valid_confidence_output:
-            confidence = float(confidence)
-        else:
-            # assume the worst for now
-            confidence = 0 if answer_is_correct else 100
+        if not valid_confidence_output:
             group_statistics[group]['invalid_counts']['confidence'] += 1
             group_statistics[ALL_GROUPS]['invalid_counts']['confidence'] += 1
             rerun_confidence_idx.append((i, group_idx))
@@ -376,7 +298,7 @@ if __name__ == "__main__":
             print("Answer:", answer)
             print("Ground Truth:", ground_truth)
             print("Confidence:", confidence)
-            #print("Response:", response)
+            print("Response:", response)
             print("Verdict:", "Correct" if answer_is_correct else "Wrong")
             print()
             
@@ -408,7 +330,8 @@ if __name__ == "__main__":
             chat_templates_answer.append(chat_templates[overall_idx][1:])
             #chat_templates_answer.append(chat_templates[overall_idx])
         
-        prompts_answer = tokenizer.apply_chat_template(chat_templates_answer, tokenize = False, add_generation_prompt = True)
+        # No thinking after initial token time limit to avoid cheating
+        prompts_answer = tokenizer.apply_chat_template(chat_templates_answer, tokenize = False, add_generation_prompt = True, enable_thinking = False)
         outputs_answer = generate_outputs(llm, prompts_answer, sampling_params_answer, lora_request)
 
         for i in range(len(chat_templates_answer)):
@@ -418,9 +341,10 @@ if __name__ == "__main__":
 
             response = outputs_answer[i].outputs[0].text
             answer = response[len(SECOND_CHANCE_ANSWER_STRING_PREFIX):]
+            final_answers[overall_idx] = answer
 
             # Re-evaluate answer
-            answer_is_correct = 1 if verify_correctness(EVAL_DATASET_NAME, answer, ground_truth, experiment_id) else 0
+            answer_is_correct = bool(verify_correctness(EVAL_DATASET_NAME, answer, ground_truth, experiment_id))
             if i < 5:
                 print("Indices: (%d, %d, %d)" % (overall_idx, group_idx, overall_idx//RESPONSES_PER_QUESTION))
                 print("Question: ", dataset[overall_idx//RESPONSES_PER_QUESTION]["question"])
@@ -443,7 +367,8 @@ if __name__ == "__main__":
             chat_templates_confidence.append(chat_templates[overall_idx][1:])
             #chat_templates_confidence.append(chat_templates[overall_idx])
 
-        prompts_confidence = tokenizer.apply_chat_template(chat_templates_confidence, tokenize = False, add_generation_prompt = True)
+        # No thinking after initial token time limit to avoid cheating
+        prompts_confidence = tokenizer.apply_chat_template(chat_templates_confidence, tokenize = False, add_generation_prompt = True, enable_thinking = False)
         outputs_confidence = generate_outputs(llm, prompts_confidence, sampling_params_confidence, lora_request)
 
         for i in range(len(chat_templates_confidence)):
@@ -464,7 +389,15 @@ if __name__ == "__main__":
     
     if not os.path.exists("models/evaluate"):
         os.makedirs("models/evaluate")
+    
+    #print(group_statistics)
 
-    with open("models/evaluate/%s.json" % output_filename, "w") as json_file:
+    with open(Path("models/evaluate") / ("%s.json" % output_filename), "w") as json_file:
         json.dump(group_statistics, json_file, indent=4)
 
+    if not os.path.exists("models/evaluate/final_answers"):
+        os.makedirs("models/evaluate/final_answers")
+    
+    with open(Path("models/evaluate/final_answers") / ("%s.json" % output_filename), "w") as json_file:
+        json.dump({"eval_config": config, "final_answers": final_answers}, json_file, indent=4)
+    
