@@ -4,13 +4,15 @@ This is the repository for the paper [will not release more details to maintain 
 
 ### Note: Code Version to Use
 
-If reproducibility for the experiments in the main sections of the paper is necessary, then refer to branch ```reproducibility```, which will contain the code used to run the experiments in the main paper and the corresponding libraries used. 
+This is a slightly updated v1 version of the code, which includes support for out-of-distribution evaluation not found inside the original v1 code. The original v1 code can be found in branch ```reproducibility```. This version of the code is kept mainly for archival reasons and for people who want to run the v1 version with out of distribution evaluation.
 
-Otherwise, the ```main``` branch should be used. It has more updated library versions to support newer large language models and more features such as out-of-distribution evaluation.
+If reproducibility for the experiments in the main sections of the paper is strictly necessary, then refer to branch ```reproducibility```, which will contain the code used to run the v1 experiments in the main paper and the corresponding libraries used. The code in branch ```reproducibility``` was used to run Qwen 2.5 (3B) Instruct, Llama 3.1 (8B) Instruct and Llama 3.2 (3B) Instruct experiments. 
+
+If you are looking to fork from this repository for another research project or a purpose other than reproducibility, starting from the branch ```main``` is recommended. The branch ```main``` corresponds to v2 of the code. In this version, later versions of vLLM, Unsloth, TRL and transformers are used, allowing for support of more recent LLMs such as Qwen 3 (4B) and Gemma 4 (E2B) Instruct. 
 
 ### Files Used
 
-The repository has 8 core files which are used for running experiments and analyzing results. The files, with the first 7 arranged in execution order, are as follows:
+The repository has 8 core files which are used for running experiments and analyzing results. The files, with the first 7 arranged in execution order, i.e. to run from **prepare_datasets.py** to **format_results.py**, are as follows:
 
 1. **prepare_datasets.py**: Downloads all datasets and converts the dataset into a consistent format for subsequent preprocessing and training.
 
@@ -40,7 +42,7 @@ Program may work with less VRAM, but we cannot guarantee that it will work. Stil
 
 To reproduce the results in the main experiments, follow the steps shown below:
 
-1. Install the relevant libraries using ```requirements.txt```. We used miniforge to install the Python environment and pip to install the Python packages, but uv and pyenv are expected to work (not tested).
+1. Install the relevant libraries using ```requirements.txt```. We used miniforge to install the Python environment and pip to install the Python packages, but uv and pyenv are expected to work (not tested). To aid in debugging, the miniforge environment has been provided via ```environment.yml```. 
 
 2. Run ```prepare_datasets.py``` to download the dataset files and split the dataset into train and test sets. Simply call ```python prepare_datasets.py```.
 
@@ -142,7 +144,7 @@ The models are stored in the ```models``` folder.
 
 ### WandB Results
 
-Details of our runs can be found in [to be released after the peer review stage as it affects anonymity].
+Details of our runs can be found in [to be released upon acceptance as it affects anonymity].
 
 Note that the values for the reinforcement learning at step 0 are unreliable because wandb resets the step count to 0 instead of the last completed step number during the first step of resumption after interruption of some of our runs. 
 
