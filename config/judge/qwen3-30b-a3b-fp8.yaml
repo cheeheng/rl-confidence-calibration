@@ -1,0 +1,5 @@
+llm_judge_short_name: qwen3-30b-a3b-fp8
+random_seed_judge: 848916633
+enable_thinking_judge: True
+thinking_budget_judge: 2048
+
